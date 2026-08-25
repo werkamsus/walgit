@@ -413,6 +413,11 @@ decision in §4 — or the PR is; never "fix later".
   service SAS (account key) or user-delegation SAS (Entra). The Blob REST API is used directly: the
   official `azure_storage_blob` 1.x client is TokenCredential-only and cannot sign Azurite/account-key
   requests. Local bar: `just test-azure` against Azurite.
+- **D43** **Protected ref namespaces have one management writer.** Host configuration
+  `git.protected_ref_prefixes` reserves namespaces from receive-pack, including policy bypasses. An admin may
+  idempotently create an existing commit there through `PUT /{o}/{r}/api/protected-ref`; an existing different
+  value conflicts. The ref transaction still publishes through the WAL, and upload-pack exposes only advertised
+  or reachable objects unless `git.allow_any_sha1_in_want` explicitly opts out.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

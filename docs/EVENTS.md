@@ -10,14 +10,14 @@ and `tests/events.rs` are its executable form (same discipline as `docs/POLICY.m
 path.** It tails each repo's log from a durable per-repo cursor, converts committed entries, POSTs them to your
 webhook, and advances the cursor after each accepted bounded group. So an event is delivered iff its entry is
 durable, a crash can't lose one, the lag is `head_seq − cursor`, and no writer — any serving host, a push broker,
-the CLI, an import — performs event delivery. Receive-pack only rejects a ref transaction that cannot fit one
-configured delivery because a WAL entry is indivisible.
+the CLI, an import — performs event delivery. Receive-pack only rejects a ref transaction whose serialized
+event body exceeds the configured byte limit because a WAL entry is indivisible.
 
 Invariants:
 
 1. Webhook availability **never gates a push**: the bridge is another process reading the bucket. A down webhook
-   adds zero milliseconds to receive-pack; it adds lag, which is a metric. Static delivery admission can reject a
-   ref transaction that exceeds `max_batch_events` or `max_batch_bytes`.
+   adds zero milliseconds to receive-pack; it adds lag, which is a metric. Static delivery admission rejects only
+   a ref transaction whose serialized event body exceeds `max_batch_bytes`.
 2. No no-op events. `old == new` (and `0→0`) emits nothing.
 3. No lost events: each cursor increment happens only after the webhook answered 2xx. Duplicates are possible
    (at-least-once) and carry a deterministic dedup key. A crash after a 2xx but before the cursor CAS retries that
@@ -62,8 +62,8 @@ Only `ref` events exist. Not events: push denials and auth failures (metrics + l
 ## Delivery: the webhook
 
 Each catch-up `POST`s one or more bounded JSON **arrays** of events from `(cursor, head_seq]` to
-`events.webhook_url`. A delivery contains only whole WAL entries and is limited by `max_batch_entries`,
-`max_batch_events`, and `max_batch_bytes`. The bridge never allocates or sends the full cursor-to-head range.
+`events.webhook_url`. A delivery contains only whole WAL entries and is limited by `max_batch_entries` and
+`max_batch_bytes`. The bridge never allocates or sends the full cursor-to-head range.
 Each request has:
 
 ```
@@ -93,8 +93,8 @@ writers (any host, broker, CLI, import) ── manifest.pb CAS ──► bucket 
 ```
 
 `catch_up(repo)` = read `repos/<o>/<r>/events/cursor.json` → fresh manifest → repeatedly read a bounded sequence
-range after the cursor → group whole entries within the configured event and byte bounds → webhook → CAS cursor
-to that group's last seq. The loop stops at the manifest head observed at the start. A webhook error leaves the
+range after the cursor → group whole entries within the configured byte bound → webhook → CAS cursor to that
+group's last seq. The loop stops at the manifest head observed at the start. A webhook error leaves the
 last accepted cursor; the next wake-up resumes there. A cold cursor starts at the oldest readable seq
 (`min_seq − 1`: everything still in the manifest's log window is published once; pre-seed the cursor to skip
 history). Cursor CAS writes are monotonic; a conflict fails the catch-up instead of overwriting another bridge's
@@ -122,7 +122,6 @@ webhook_url = "https://hooks.example.com/walgit"
 webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET
 sweep_interval = "5m"
 max_batch_entries = 128       # max WAL sequence span considered for one delivery
-max_batch_events = 1000       # max events; one larger ref transaction is rejected
 max_batch_bytes = "1 MiB"     # max JSON body; one larger ref transaction is rejected
 ```
 

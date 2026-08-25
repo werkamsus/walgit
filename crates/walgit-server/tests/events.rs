@@ -60,13 +60,13 @@ fn bridge_cfg(url: &str, sweep: Duration) -> impl FnOnce(&mut walgit_config::Con
 fn bounded_bridge_cfg(
     url: &str,
     max_entries: usize,
-    max_events: usize,
+    max_bytes: u64,
 ) -> impl FnOnce(&mut walgit_config::Config) + '_ {
     move |c| {
         c.events.webhook_url = Some(url.to_string());
         c.events.sweep_interval = Duration::ZERO;
         c.events.max_batch_entries = max_entries;
-        c.events.max_batch_events = max_events;
+        c.events.max_batch_bytes = bytesize::ByteSize::b(max_bytes);
     }
 }
 
@@ -255,7 +255,7 @@ async fn bridge_sweep_timer_publishes_without_notifications() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_drains_backlog_as_bounded_whole_entry_deliveries() -> TestResult {
     let (url, captured) = webhook().await;
-    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 100)).await?;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 1024 * 1024)).await?;
     let bridge = server.state.bridge.clone().expect("bridge enabled");
     server.put_repo("t", "bounded").await?;
     let id = walgit_git::RepoId::new("t", "bounded")?;
@@ -264,12 +264,7 @@ async fn bridge_drains_backlog_as_bounded_whole_entry_deliveries() -> TestResult
     git_in(&src, &["branch", "-M", "main"])?;
     git_in(
         &src,
-        &[
-            "remote",
-            "add",
-            "origin",
-            &server.repo_url("t", "bounded"),
-        ],
+        &["remote", "add", "origin", &server.repo_url("t", "bounded")],
     )?;
     git_in(&src, &["push", "-u", "origin", "main"])?;
     for message in ["b", "c"] {
@@ -278,7 +273,10 @@ async fn bridge_drains_backlog_as_bounded_whole_entry_deliveries() -> TestResult
     }
 
     let report = bridge.catch_up(&id).await?;
-    assert_eq!((report.from_seq, report.head_seq, report.emitted), (0, 3, 3));
+    assert_eq!(
+        (report.from_seq, report.head_seq, report.emitted),
+        (0, 3, 3)
+    );
     assert_eq!(cursor_seq(&server, "t", "bounded").await, Some(3));
     let batches = captured.lock().clone();
     assert_eq!(batches.len(), 3);
@@ -294,7 +292,7 @@ async fn bridge_drains_backlog_as_bounded_whole_entry_deliveries() -> TestResult
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_failure_resumes_after_last_accepted_batch() -> TestResult {
     let (url, captured) = webhook_failing_on(Some(2)).await;
-    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 100)).await?;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 1024 * 1024)).await?;
     let bridge = server.state.bridge.clone().expect("bridge enabled");
     server.put_repo("t", "resume").await?;
     let id = walgit_git::RepoId::new("t", "resume")?;
@@ -311,7 +309,10 @@ async fn bridge_failure_resumes_after_last_accepted_batch() -> TestResult {
         git_in(&src, &["push"])?;
     }
 
-    let err = bridge.catch_up(&id).await.expect_err("second delivery fails");
+    let err = bridge
+        .catch_up(&id)
+        .await
+        .expect_err("second delivery fails");
     assert!(err.to_string().contains("webhook sink"), "{err:#}");
     assert_eq!(
         cursor_seq(&server, "t", "resume").await,
@@ -320,7 +321,10 @@ async fn bridge_failure_resumes_after_last_accepted_batch() -> TestResult {
     );
 
     let report = bridge.catch_up(&id).await?;
-    assert_eq!((report.from_seq, report.head_seq, report.emitted), (1, 3, 2));
+    assert_eq!(
+        (report.from_seq, report.head_seq, report.emitted),
+        (1, 3, 2)
+    );
     assert_eq!(cursor_seq(&server, "t", "resume").await, Some(3));
     let batches = captured.lock().clone();
     let seqs: Vec<_> = batches
@@ -336,9 +340,9 @@ async fn bridge_failure_resumes_after_last_accepted_batch() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn receive_pack_rejects_one_entry_larger_than_the_delivery_limit() -> TestResult {
+async fn receive_pack_rejects_one_entry_larger_than_the_byte_limit() -> TestResult {
     let (url, captured) = webhook().await;
-    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 128, 1)).await?;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 128, 512)).await?;
     server.put_repo("t", "oversized").await?;
     let src = TestRepo::synthetic(1, 1)?;
     git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
@@ -364,7 +368,10 @@ async fn receive_pack_rejects_one_entry_larger_than_the_delivery_limit() -> Test
         .output()?;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("events.max_batch_events is 1"), "{stderr}");
+    assert!(
+        stderr.contains("events.max_batch_bytes is 512 bytes"),
+        "{stderr}"
+    );
 
     let id = walgit_git::RepoId::new("t", "oversized")?;
     let handle = server.state.registry.open(&id).await?;

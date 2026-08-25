@@ -59,7 +59,6 @@ pub struct Bridge {
     store_prefix: String,
     sinks: Vec<Box<dyn Sink>>,
     max_batch_entries: usize,
-    max_batch_events: usize,
     max_batch_bytes: u64,
     serial: tokio::sync::Mutex<()>,
 }
@@ -93,7 +92,6 @@ impl Bridge {
             store_prefix: cfg.store_prefix(),
             sinks,
             max_batch_entries: cfg.events.max_batch_entries,
-            max_batch_events: cfg.events.max_batch_events,
             max_batch_bytes: cfg.events.max_batch_bytes.as_u64(),
             serial: tokio::sync::Mutex::new(()),
         }))
@@ -155,12 +153,6 @@ impl Bridge {
 
             for entry in entries {
                 let event_count = events::ref_event_count(&entry);
-                anyhow::ensure!(
-                    event_count <= self.max_batch_events,
-                    "WAL entry {} cannot fit one event delivery ({} events)",
-                    entry.seq,
-                    event_count
-                );
                 let mut entry_events = Vec::with_capacity(event_count);
                 events::refs_from_entries(id, std::slice::from_ref(&entry), &mut entry_events);
                 let entry_bytes = events::batch_json_len(&entry_events)?;
@@ -172,9 +164,7 @@ impl Bridge {
                 );
                 let separator = u64::from(!batch.is_empty() && !entry_events.is_empty());
                 let next_bytes = batch_bytes + entry_bytes.saturating_sub(2) + separator;
-                if batch.len() + entry_events.len() > self.max_batch_events
-                    || next_bytes > self.max_batch_bytes
-                {
+                if next_bytes > self.max_batch_bytes {
                     consumed_all = false;
                     break;
                 }
@@ -188,7 +178,10 @@ impl Bridge {
                 // safe after every committed entry in this bounded range was read.
                 batch_end = read_to;
             }
-            anyhow::ensure!(batch_end > from, "events bridge made no cursor progress after seq {from}");
+            anyhow::ensure!(
+                batch_end > from,
+                "events bridge made no cursor progress after seq {from}"
+            );
 
             // A failing sink returns here. Earlier accepted groups already have
             // durable cursors; this group is retried in full.
@@ -448,7 +441,6 @@ mod tests {
             store_prefix: "prefix/".into(),
             sinks: Vec::new(),
             max_batch_entries: 128,
-            max_batch_events: 1_000,
             max_batch_bytes: 1024 * 1024,
             serial: tokio::sync::Mutex::new(()),
         };

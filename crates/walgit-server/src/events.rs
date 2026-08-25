@@ -184,7 +184,6 @@ pub(crate) fn ensure_entry_fits(
     repo: &RepoId,
     txn: &walgit_proto::v1::RefTransaction,
     meta: &std::collections::HashMap<String, String>,
-    max_events: usize,
     max_bytes: u64,
 ) -> anyhow::Result<()> {
     let entry = LogEntry {
@@ -195,10 +194,6 @@ pub(crate) fn ensure_entry_fits(
         ..Default::default()
     };
     let event_count = ref_event_count(&entry);
-    anyhow::ensure!(
-        event_count <= max_events,
-        "ref transaction produces {event_count} events; events.max_batch_events is {max_events}"
-    );
     let mut events = Vec::with_capacity(event_count);
     refs_from_entries(repo, &[entry], &mut events);
     let bytes = batch_json_len(&events)?;

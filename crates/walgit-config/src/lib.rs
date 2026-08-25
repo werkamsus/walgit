@@ -784,8 +784,6 @@ pub struct EventsConfig {
     pub sweep_interval: Duration,
     /// Maximum WAL entries read and considered for one webhook delivery.
     pub max_batch_entries: usize,
-    /// Maximum ref events in one webhook delivery.
-    pub max_batch_events: usize,
     /// Maximum serialized JSON bytes in one webhook delivery.
     pub max_batch_bytes: ByteSize,
 }
@@ -797,7 +795,6 @@ impl Default for EventsConfig {
             webhook_secret: None,
             sweep_interval: Duration::from_secs(300),
             max_batch_entries: 128,
-            max_batch_events: 1_000,
             max_batch_bytes: ByteSize::mib(1),
         }
     }
@@ -1652,10 +1649,6 @@ impl Config {
             "events.max_batch_entries must be greater than zero"
         );
         anyhow::ensure!(
-            self.events.max_batch_events > 0,
-            "events.max_batch_events must be greater than zero"
-        );
-        anyhow::ensure!(
             self.events.max_batch_bytes.as_u64() >= 2,
             "events.max_batch_bytes must fit a JSON array"
         );
@@ -2048,7 +2041,6 @@ sweep_interval = "1m"
 webhook_url = "https://hooks.example.com/walgit"
 webhook_secret = "s"
 max_batch_entries = 12
-max_batch_events = 34
 max_batch_bytes = "512 KiB"
 "#,
         )
@@ -2056,13 +2048,8 @@ max_batch_bytes = "512 KiB"
         assert_eq!(c.events.sweep_interval, Duration::from_secs(60));
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         assert_eq!(c.events.max_batch_entries, 12);
-        assert_eq!(c.events.max_batch_events, 34);
         assert_eq!(c.events.max_batch_bytes, ByteSize::kib(512));
-        for bad in [
-            "max_batch_entries = 0",
-            "max_batch_events = 0",
-            "max_batch_bytes = \"1 B\"",
-        ] {
+        for bad in ["max_batch_entries = 0", "max_batch_bytes = \"1 B\""] {
             let err = Config::parse(&format!("[events]\n{bad}\n")).unwrap_err();
             assert!(err.to_string().contains("events.max_batch"), "{err}");
         }

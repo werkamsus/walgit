@@ -291,5 +291,4 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
 # max_batch_entries = 128         # max WAL sequence span read and considered for one delivery
-# max_batch_events = 1000         # max ref events in one delivery; one larger ref transaction is rejected before publish
 # max_batch_bytes = "1 MiB"       # max serialized JSON body; one larger ref transaction is rejected before publish

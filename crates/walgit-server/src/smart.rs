@@ -1290,7 +1290,6 @@ async fn receive_pack_process(
         &route_id,
         &txn,
         &meta,
-        st.cfg.events.max_batch_events,
         st.cfg.events.max_batch_bytes.as_u64(),
     ) {
         tracing::warn!(repo = %route_id, error = %e, "receive-pack: event delivery limit exceeded");

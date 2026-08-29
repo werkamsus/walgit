@@ -65,29 +65,48 @@ pub struct S3Store {
     multipart_threshold: u64,
     multipart_part_size: u64,
 }
+fn resolve_credentials(
+    access_key_env: &str,
+    secret_key_env: &str,
+    access_key: std::result::Result<String, std::env::VarError>,
+    secret_key: std::result::Result<String, std::env::VarError>,
+    session_token: Option<String>,
+) -> anyhow::Result<Option<Credentials>> {
+    match (access_key, secret_key) {
+        (Ok(access_key), Ok(secret_key)) => Ok(Some(Credentials::new(
+            access_key,
+            secret_key,
+            session_token,
+            None,
+            "walgit-static",
+        ))),
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+        _ => anyhow::bail!(
+            "s3: env vars {access_key_env} and {secret_key_env} must both be set or both be absent"
+        ),
+    }
+}
 
 impl S3Store {
-    /// Build a store from `walgit-config::StoreConfig`.
-    ///
-    /// Credentials are read from the env vars named in
-    /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+    /// Explicit credentials use the env vars named in `cfg.s3.access_key_env`
+    /// and `cfg.s3.secret_key_env`. When both are absent, the AWS SDK default
+    /// provider chain supplies credentials, including EKS web identity (IRSA).
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
-        })?;
-        let secret_key = std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
-        })?;
-
-        let creds = Credentials::new(&access_key, &secret_key, None, None, "walgit-static");
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
-
-        let mut s3_config = aws_sdk_s3::Config::builder()
-            .region(region)
-            .credentials_provider(creds)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
+        let mut config_loader =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+        if let Some(credentials) = resolve_credentials(
+            &cfg.s3.access_key_env,
+            &cfg.s3.secret_key_env,
+            std::env::var(&cfg.s3.access_key_env),
+            std::env::var(&cfg.s3.secret_key_env),
+            std::env::var("AWS_SESSION_TOKEN").ok(),
+        )? {
+            config_loader = config_loader.credentials_provider(credentials);
+        }
+        let shared_config = config_loader.load().await;
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+            .force_path_style(cfg.s3.force_path_style);
 
         if !cfg.s3.endpoint.is_empty() {
             s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
@@ -904,3 +923,56 @@ impl S3Store {
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
 //    stripped consistently in our Version.
 // 9. force_path_style: required for rustfs local dev.
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn falls_back_to_default_chain_when_static_credentials_are_absent() {
+        let credentials = resolve_credentials(
+            "CUSTOM_ACCESS_KEY",
+            "CUSTOM_SECRET_KEY",
+            Err(std::env::VarError::NotPresent),
+            Err(std::env::VarError::NotPresent),
+            None,
+        )
+        .unwrap();
+
+        assert!(credentials.is_none());
+    }
+
+    #[test]
+    fn preserves_explicit_credentials_and_session_token() {
+        let credentials = resolve_credentials(
+            "CUSTOM_ACCESS_KEY",
+            "CUSTOM_SECRET_KEY",
+            Ok("access-key".into()),
+            Ok("secret-key".into()),
+            Some("session-token".into()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(credentials.access_key_id(), "access-key");
+        assert_eq!(credentials.secret_access_key(), "secret-key");
+        assert_eq!(credentials.session_token(), Some("session-token"));
+    }
+
+    #[test]
+    fn rejects_partial_static_credentials() {
+        let error = resolve_credentials(
+            "CUSTOM_ACCESS_KEY",
+            "CUSTOM_SECRET_KEY",
+            Ok("access-key".into()),
+            Err(std::env::VarError::NotPresent),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "s3: env vars CUSTOM_ACCESS_KEY and CUSTOM_SECRET_KEY must both be set or both be absent"
+        );
+    }
+}

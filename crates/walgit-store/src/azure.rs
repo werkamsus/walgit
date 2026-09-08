@@ -45,6 +45,10 @@ use crate::{
 const API_VERSION: &str = "2021-12-02";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
+const MAX_BLOCKS: u32 = 50_000;
+const BLOB_ALREADY_EXISTS: &str = "BlobAlreadyExists";
+const CONTAINER_BEING_DELETED: &str = "ContainerBeingDeleted";
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -87,10 +91,12 @@ impl AzureStore {
         let parsed = resolve_azure(cfg)?;
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(8)
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()?;
         let bulk = reqwest::Client::builder()
             .pool_max_idle_per_host(32)
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(3600))
             .build()?;
         Ok(AzureStore {
@@ -224,6 +230,7 @@ impl AzureStore {
     fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
         let status = resp.status().as_u16();
         let etag = header_str(resp.headers(), "etag").map(|s| strip_etag(&s));
+        let error_code = header_str(resp.headers(), "x-ms-error-code");
         let content_length =
             header_str(resp.headers(), "content-length").and_then(|s| s.parse::<u64>().ok());
         let total = header_str(resp.headers(), "content-range").and_then(|v| {
@@ -248,30 +255,68 @@ impl AzureStore {
             304 => Ok(GetResult::NotModified {
                 version: Version::new(etag.as_deref().unwrap_or("")),
             }),
-            404 => Err(StoreError::NotFound { key: key.into() }),
-            412 | 409 => Err(StoreError::PreconditionFailed {
-                key: key.into(),
-                current: etag.map(Version::new),
-            }),
-            s if s >= 500 || s == 429 => Err(StoreError::Retryable(anyhow::anyhow!(
-                "azure get status {s}"
-            ))),
-            s => Err(StoreError::Other(anyhow::anyhow!("azure get status {s}"))),
+            _ => Err(Self::classify_status(
+                key,
+                status,
+                etag,
+                error_code.as_deref(),
+                &format!("azure get status {status}"),
+            )),
         }
     }
 
-    fn classify_write(key: &str, status: u16, etag: Option<String>, body: &str) -> StoreError {
+    fn classify_status(
+        key: &str,
+        status: u16,
+        etag: Option<String>,
+        error_code: Option<&str>,
+        detail: &str,
+    ) -> StoreError {
         match status {
             404 => StoreError::NotFound { key: key.into() },
-            412 | 409 => StoreError::PreconditionFailed {
+            409 => match error_code {
+                None | Some(BLOB_ALREADY_EXISTS) => StoreError::PreconditionFailed {
+                    key: key.into(),
+                    current: etag.map(Version::new),
+                },
+                Some(CONTAINER_BEING_DELETED) => StoreError::retryable(anyhow::anyhow!("{detail}")),
+                Some(_) => StoreError::other(anyhow::anyhow!("{detail}")),
+            },
+            412 => StoreError::PreconditionFailed {
                 key: key.into(),
                 current: etag.map(Version::new),
             },
-            s if s >= 500 || s == 429 => {
-                StoreError::Retryable(anyhow::anyhow!("azure status {s}: {body}"))
-            }
-            s => StoreError::Other(anyhow::anyhow!("azure status {s}: {body}")),
+            429 | 500..=599 => StoreError::retryable(anyhow::anyhow!("{detail}")),
+            _ => StoreError::other(anyhow::anyhow!("{detail}")),
         }
+    }
+
+    fn classify_write(
+        key: &str,
+        status: u16,
+        etag: Option<String>,
+        error_code: Option<&str>,
+        body: &str,
+    ) -> StoreError {
+        Self::classify_status(
+            key,
+            status,
+            etag,
+            error_code,
+            &format!("azure status {status}: {body}"),
+        )
+    }
+
+    fn block_count(key: &str, len: u64, part_size: u64) -> Result<u32> {
+        let blocks = len.div_ceil(part_size.max(1)).max(1);
+        if blocks > u64::from(MAX_BLOCKS) {
+            return Err(StoreError::InvalidArgument(format!(
+                "azure put {key}: {len} bytes at a {part_size}-byte part size needs {blocks} blocks, over the service limit of {MAX_BLOCKS}"
+            )));
+        }
+        u32::try_from(blocks).map_err(|_| {
+            StoreError::InvalidArgument(format!("azure put {key}: block count does not fit u32"))
+        })
     }
 
     async fn put_blob(&self, key: &str, body: Bytes, opts: &PutOptions) -> Result<ObjectMeta> {
@@ -294,6 +339,7 @@ impl AzureStore {
         let resp = self.execute(builder, bulk).await?;
         let status = resp.status().as_u16();
         let etag = header_str(resp.headers(), "etag").map(|s| strip_etag(&s));
+        let error_code = header_str(resp.headers(), "x-ms-error-code");
         if (200..300).contains(&status) {
             return Ok(ObjectMeta {
                 key: key.into(),
@@ -302,7 +348,7 @@ impl AzureStore {
             });
         }
         let body = resp.text().await.unwrap_or_default();
-        let mut err = Self::classify_write(key, status, etag, &body);
+        let mut err = Self::classify_write(key, status, etag, error_code.as_deref(), &body);
         if let StoreError::PreconditionFailed { current: c, .. } = &mut err
             && c.is_none()
         {
@@ -338,8 +384,15 @@ impl AzureStore {
         if (200..300).contains(&status) {
             return Ok(());
         }
+        let error_code = header_str(resp.headers(), "x-ms-error-code");
         let body = resp.text().await.unwrap_or_default();
-        Err(Self::classify_write(key, status, None, &body))
+        Err(Self::classify_write(
+            key,
+            status,
+            None,
+            error_code.as_deref(),
+            &body,
+        ))
     }
 
     async fn put_block_from_url(
@@ -369,8 +422,15 @@ impl AzureStore {
         if (200..300).contains(&status) {
             return Ok(());
         }
+        let error_code = header_str(resp.headers(), "x-ms-error-code");
         let body = resp.text().await.unwrap_or_default();
-        Err(Self::classify_write(dest, status, None, &body))
+        Err(Self::classify_write(
+            dest,
+            status,
+            None,
+            error_code.as_deref(),
+            &body,
+        ))
     }
 
     async fn commit_block_list(
@@ -406,6 +466,7 @@ impl AzureStore {
         let resp = self.execute(builder, bulk).await?;
         let status = resp.status().as_u16();
         let etag = header_str(resp.headers(), "etag").map(|s| strip_etag(&s));
+        let error_code = header_str(resp.headers(), "x-ms-error-code");
         if (200..300).contains(&status) {
             return Ok(ObjectMeta {
                 key: key.into(),
@@ -414,7 +475,7 @@ impl AzureStore {
             });
         }
         let body = resp.text().await.unwrap_or_default();
-        let mut err = Self::classify_write(key, status, etag, &body);
+        let mut err = Self::classify_write(key, status, etag, error_code.as_deref(), &body);
         if let StoreError::PreconditionFailed { current: c, .. } = &mut err
             && c.is_none()
         {
@@ -430,6 +491,7 @@ impl AzureStore {
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
         let size = data.len() as u64;
+        Self::block_count(key, size, self.multipart_part_size)?;
         let part = self.multipart_part_size as usize;
         let upload = Self::upload_id();
         let mut n = 0u32;
@@ -455,6 +517,7 @@ impl AzureStore {
         len: u64,
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
+        Self::block_count(key, len, self.multipart_part_size)?;
         let part = self.multipart_part_size as usize;
         let upload = Self::upload_id();
         let mut buf = bytes::BytesMut::new();
@@ -499,8 +562,15 @@ impl AzureStore {
         let resp = self.execute(self.http.get(&url), false).await?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
+            let error_code = header_str(resp.headers(), "x-ms-error-code");
             let body = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_write(prefix, status, None, &body));
+            return Err(Self::classify_write(
+                prefix,
+                status,
+                None,
+                error_code.as_deref(),
+                &body,
+            ));
         }
         let body = resp
             .text()
@@ -971,9 +1041,16 @@ impl ObjectStore for AzureStore {
                 }))
             }
             404 => Ok(None),
-            s => {
+            status => {
+                let error_code = header_str(resp.headers(), "x-ms-error-code");
                 let body = resp.text().await.unwrap_or_default();
-                Err(Self::classify_write(key, s, None, &body))
+                Err(Self::classify_write(
+                    key,
+                    status,
+                    None,
+                    error_code.as_deref(),
+                    &body,
+                ))
             }
         }
     }
@@ -1021,22 +1098,22 @@ impl ObjectStore for AzureStore {
         }
         let response = self.execute(builder, false).await?;
         let status = response.status().as_u16();
-        match status {
-            200 | 202 => Ok(()),
-            404 if if_version.is_none() => Ok(()),
-            404 => Err(StoreError::NotFound { key: key.into() }),
-            412 | 409 => match self.head(key).await? {
-                None => Err(StoreError::NotFound { key: key.into() }),
-                Some(meta) => Err(StoreError::PreconditionFailed {
-                    key: key.into(),
-                    current: Some(meta.version),
-                }),
-            },
-            status => {
-                let body = response.text().await.unwrap_or_default();
-                Err(Self::classify_write(key, status, None, &body))
+        if matches!(status, 200 | 202) {
+            return Ok(());
+        }
+        if status == 404 && if_version.is_none() {
+            return Ok(());
+        }
+        let error_code = header_str(response.headers(), "x-ms-error-code");
+        let body = response.text().await.unwrap_or_default();
+        let mut err = Self::classify_write(key, status, None, error_code.as_deref(), &body);
+        if let StoreError::PreconditionFailed { current, .. } = &mut err {
+            match self.head(key).await? {
+                Some(meta) => *current = Some(meta.version),
+                None => return Err(StoreError::NotFound { key: key.into() }),
             }
         }
+        Err(err)
     }
 
     fn list(
@@ -1154,7 +1231,22 @@ impl ObjectStore for AzureStore {
                 .ok_or_else(|| StoreError::NotFound { key: src.clone() })?;
             sizes.push(m.size);
         }
-        let total: u64 = sizes.iter().sum();
+        let total = sizes.iter().try_fold(0u64, |sum, size| {
+            sum.checked_add(*size).ok_or_else(|| {
+                StoreError::InvalidArgument("azure compose source sizes overflow u64".into())
+            })
+        })?;
+        let blocks = sizes.iter().try_fold(0u64, |sum, size| {
+            let source_blocks = size.div_ceil(self.multipart_part_size).max(1);
+            sum.checked_add(source_blocks).ok_or_else(|| {
+                StoreError::InvalidArgument("azure compose block count overflow u64".into())
+            })
+        })?;
+        if blocks > u64::from(MAX_BLOCKS) {
+            return Err(StoreError::InvalidArgument(format!(
+                "azure compose {dest}: {blocks} blocks exceed the service limit of {MAX_BLOCKS}"
+            )));
+        }
         let upload = Self::upload_id();
         let mut n = 0u32;
         for (src, size) in sources.iter().zip(sizes.iter().copied()) {
@@ -1244,6 +1336,43 @@ mod tests {
         let second = AzureStore::block_id("second", 0);
         assert_ne!(first, second);
         assert_eq!(first, AzureStore::block_id("first", 0));
+    }
+
+    #[test]
+    fn azure_conflicts_preserve_retry_semantics() {
+        let precondition =
+            AzureStore::classify_status("k", 409, None, Some(BLOB_ALREADY_EXISTS), "blob exists");
+        assert!(matches!(
+            precondition,
+            StoreError::PreconditionFailed { .. }
+        ));
+
+        let transient = AzureStore::classify_status(
+            "k",
+            409,
+            None,
+            Some(CONTAINER_BEING_DELETED),
+            "container deleting",
+        );
+        assert!(transient.is_retryable());
+
+        let permanent =
+            AzureStore::classify_status("k", 409, None, Some("LeaseIdMissing"), "lease conflict");
+        assert!(!permanent.is_retryable());
+        assert!(!matches!(permanent, StoreError::PreconditionFailed { .. }));
+    }
+
+    #[test]
+    fn azure_rejects_uploads_above_the_block_limit() {
+        let max_len = u64::from(MAX_BLOCKS) * 32;
+        assert_eq!(
+            AzureStore::block_count("k", max_len, 32).expect("maximum fits"),
+            MAX_BLOCKS
+        );
+        assert!(matches!(
+            AzureStore::block_count("k", max_len + 1, 32),
+            Err(StoreError::InvalidArgument(_))
+        ));
     }
 
     #[test]

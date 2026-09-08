@@ -1,4 +1,5 @@
 //! Azure Blob Storage backend.
+//! LARGE_FILE: Keep one backend cohesive so its authentication, CAS, multipart, compose, and signing invariants are reviewed together.
 //!
 //! Speaks the Blob REST API over `reqwest` with Shared Key (HMAC-SHA256) or
 //! AKS Workload Identity. The REST API keeps account-key/Azurite support and
